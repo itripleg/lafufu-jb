@@ -41,15 +41,10 @@ LAFUFU_ESPEAK_VOICE = "en-us"
 LAFUFU_PYTTSX3_KEYWORDS = ("child", "kid", "young", "girl", "boy", "zira", "hazel", "aria", "jenny")
 
 # ------------------ Piper TTS (offline) ------------------
-_IS_LINUX = platform.system().lower() == "linux"
-_IS_ARM = platform.machine().lower() in ("aarch64", "arm64", "armv7l", "armv8l", "arm")
-_PIPER_DEFAULT_QUALITY = "low" if _IS_LINUX and _IS_ARM else "high"
-PIPER_MODEL_DEFAULT = f"models/en_US-libritts-{_PIPER_DEFAULT_QUALITY}.onnx"
-PIPER_CONFIG_DEFAULT = f"models/en_US-libritts-{_PIPER_DEFAULT_QUALITY}.onnx.json"
+PIPER_MODEL_DEFAULT = "models/en_US-libritts_r-medium.onnx"
+PIPER_CONFIG_DEFAULT = "models/en_US-libritts_r-medium.onnx.json"
 PIPER_MODEL_CANDIDATES = (
-    "models/en_US-libritts-low.onnx",
-    "models/en_US-libritts-medium.onnx",
-    "models/en_US-libritts-high.onnx",
+    "models/en_US-libritts_r-medium.onnx",
 )
 PIPER_SPEAKER_DEFAULT = 0
 PIPER_LENGTH_SCALE_DEFAULT = 0.9  # slightly faster speech by default

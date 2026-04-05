@@ -17,15 +17,18 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+import audioop
 import pyaudio
 import pyttsx3
 import whisper
 
 # ------------------ Audio / VAD ------------------
-CHUNK = 600
+CHUNK = 1764           # ~40 ms at 44100 Hz (was 600 at 16 kHz)
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 16000
+MIC_RATE = 44100       # native rate of the Shure MV88
+WHISPER_RATE = 16000   # Whisper expects 16 kHz
+RATE = MIC_RATE        # recording rate
 OUTPUT_FILENAME = "temp.wav"
 
 SILENCE_THRESHOLD = 800
@@ -127,15 +130,15 @@ JAW_RANGE_DEG = 17.05
 SIM_JAW_CLOSE_DEG = 0.0
 SIM_JAW_OPEN_DEG = JAW_RANGE_DEG
 
-DXL_EYE_LEFT_POS = 2000
-DXL_EYE_RIGHT_POS = 2077
+DXL_EYE_LEFT_POS = 1960
+DXL_EYE_RIGHT_POS = 2130
 EYE_RANGE_DEG = 6.75
 EYE_HALF_DEG = EYE_RANGE_DEG * 0.5
 
 # ------------------ Eyes (simulator degrees; realistic range) ------------------
 EYE_MIN_DEG = -EYE_HALF_DEG
 EYE_MAX_DEG = EYE_HALF_DEG
-EYE_IDLE_DXL = 2039
+EYE_IDLE_DXL = 2045
 EYE_TRANSITION_S = 0.12
 
 # ------------------ Eyebrows (simulator degrees; realistic range) ------------------
@@ -300,7 +303,7 @@ IDLE_PAUSE_MAX_S = 3.5
 
 IDLE_HEAD_LR_AMP_DXL = HEAD_LR_RANGE_DXL * 0.06
 IDLE_HEAD_UD_AMP_DXL = HEAD_UD_RANGE_DXL * 0.05
-IDLE_EYE_AMP_DXL = EYE_RANGE_DXL * 0.18
+IDLE_EYE_AMP_DXL = EYE_RANGE_DXL * 0.45
 IDLE_BROW_AMP_DXL = BROW_RANGE_DXL * 0.16
 
 IDLE_HEAD_FREQ_MIN = 0.08
@@ -950,11 +953,15 @@ def record_until_silence() -> Path:
             stream.close()
             p.terminate()
 
+        raw = b"".join(frames)
+        if MIC_RATE != WHISPER_RATE:
+            raw, _ = audioop.ratecv(raw, p.get_sample_size(FORMAT), CHANNELS,
+                                    MIC_RATE, WHISPER_RATE, None)
         with wave.open(OUTPUT_FILENAME, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(p.get_sample_size(FORMAT))
-            wf.setframerate(RATE)
-            wf.writeframes(b"".join(frames))
+            wf.setframerate(WHISPER_RATE)
+            wf.writeframes(raw)
 
         _head_set_target(HEAD_IDLE_LR_DXL, HEAD_IDLE_UD_DXL)
         _eye_set_target(EYE_IDLE_DXL)
@@ -965,7 +972,7 @@ def record_until_silence() -> Path:
 
 def transcribe(audio_path: Path, model) -> str:
     chat_print("Transcribing...")
-    result = model.transcribe(str(audio_path), fp16=False)
+    result = model.transcribe(str(audio_path), fp16=False, language="en")
     return result["text"].strip()
 
 # ------------------ Ollama ------------------
@@ -1550,12 +1557,32 @@ def render_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
     except Exception:
         return False
 
+def _find_usb_speaker():
+    """Auto-detect a USB speaker (prefer Jabra, fall back to first USB audio)."""
+    try:
+        p = _quiet_pyaudio()
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info["maxOutputChannels"] > 0:
+                name = info["name"].lower()
+                if "jabra" in name or ("usb" in name and "shure" not in name):
+                    p.terminate()
+                    # Return ALSA hw name from card index
+                    card = info.get("name", "")
+                    return f"plughw:{info['index']}"
+        p.terminate()
+    except Exception:
+        pass
+    return None
+
 def _aplay_cmd(wav_path: Path):
     aplay_path = shutil.which("aplay")
     if not aplay_path:
         return None
     cmd = [aplay_path, "-q"]
     device = os.environ.get("LAFUFU_APLAY_DEVICE")
+    if not device:
+        device = "plughw:CARD=USB,DEV=0"   # Jabra SPEAK 510
     if device:
         cmd.extend(["-D", device])
     cmd.append(str(wav_path))
@@ -1772,11 +1799,13 @@ def main() -> int:
     parser.add_argument("--piper-noise-scale", type=float, default=PIPER_NOISE_SCALE_DEFAULT)
     parser.add_argument("--piper-noise-w", type=float, default=PIPER_NOISE_W_DEFAULT)
     parser.add_argument("--piper-pitch", type=float, default=PIPER_PITCH_CENTS_DEFAULT, help="Pitch shift cents via librosa (0 disables).")
+    parser.add_argument("--system-prompt", type=str, default=None, help="Override the system prompt sent to Qwen.")
     parser.add_argument("--text-input", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--no-lipsync", action="store_true")
     parser.add_argument("--no-printer", action="store_true", help="Disable printing Lafufu replies.")
     parser.add_argument("--silence-threshold", type=int, default=SILENCE_THRESHOLD, help="RMS threshold for voice activity detection (default 800). Raise if ambient noise causes false triggers.")
+    parser.add_argument("--debug", action="store_true", help="Loop eye/jaw/nod sweep for testing, Ctrl+C to stop.")
 
     # sim vs real
     parser.add_argument("--sim", action="store_true", help="Simulator only (no Dynamixel). Still sends UDP to Blender.")
@@ -1857,7 +1886,58 @@ def main() -> int:
     # seed pose
     vals = _send_pose_outputs(seed_jaw_dxl, _head_lr_cur, _head_ud_cur, _eye_cur, _brow_cur)
     _status.update_if_changed(*vals)
+
+    # --- debug: sweep eyes, jaw, head for testing ---
+    if args.debug:
+        eye_lo, eye_hi = DXL_CLAMP["eye"]
+        eye_mid = (eye_lo + eye_hi) / 2.0
+        jaw_lo, jaw_hi = DXL_CLAMP["jaw"]
+        jaw_open = min(jaw_lo, jaw_hi)
+        jaw_close = max(jaw_lo, jaw_hi)
+        jaw_wider = jaw_open - int((jaw_close - jaw_open) * 0.25)
+        hud_lo, hud_hi = DXL_CLAMP["head_ud"]
+        hud_up = min(hud_lo, hud_hi)
+        hud_down = max(hud_lo, hud_hi)
+        hud_mid = (hud_up + hud_down) / 2.0
+
+        steps = 80
+        e = float(_eye_cur)
+        j = float(seed_jaw_dxl)
+        h = float(_head_ud_cur)
+
+        sequence = [
+            (eye_lo, jaw_close, hud_mid, "EYE LEFT, JAW CLOSED, HEAD MID"),
+            (eye_hi, jaw_wider, hud_mid, "EYE RIGHT, JAW WIDE, HEAD MID"),
+            (eye_mid, jaw_close, hud_up, "EYE CENTER, JAW CLOSED, NOD UP"),
+            (eye_mid, jaw_close, hud_down, "EYE CENTER, JAW CLOSED, NOD DOWN"),
+            (eye_lo, jaw_wider, hud_up, "EYE LEFT, JAW WIDE, NOD UP"),
+            (eye_hi, jaw_close, hud_down, "EYE RIGHT, JAW CLOSED, NOD DOWN"),
+            (eye_mid, jaw_close, hud_mid, "ALL CENTER"),
+        ]
+        chat_print(f"DEBUG: eye={eye_lo}-{eye_hi} jaw={jaw_wider}-{jaw_close} head_ud={hud_up}-{hud_down}")
+        chat_print("Looping... Ctrl+C to stop.")
+        try:
+            while True:
+                for et, jt, ht, label in sequence:
+                    chat_print(f"  -> {label}")
+                    for i in range(steps):
+                        t = (i + 1) / steps
+                        e += (et - e) * t
+                        j += (jt - j) * t
+                        h += (ht - h) * t
+                        if _dxl_bus:
+                            _dxl_bus.send_pose(int(j), int(h), int(_head_lr_cur), int(round(e)), int(_brow_cur), force=True)
+                        time.sleep(0.02)
+                    time.sleep(1.5)
+        except KeyboardInterrupt:
+            chat_print("\nStopped.")
+        if _dxl_bus is not None:
+            _dxl_bus.close()
+        return 0
+
     _start_idle_animation()
+
+    active_prompt = args.system_prompt if args.system_prompt else SYSTEM_PROMPT
 
     whisper_model = None
     if not args.text_input:
@@ -1865,7 +1945,7 @@ def main() -> int:
         whisper_model = whisper.load_model(args.whisper_model)
 
     if not args.no_warmup:
-        warmup_qwen(args.qwen_model, SYSTEM_PROMPT, keep_alive=keep_alive)
+        warmup_qwen(args.qwen_model, active_prompt, keep_alive=keep_alive)
 
     tts_config = None
     if not args.no_tts:
@@ -1907,7 +1987,7 @@ def main() -> int:
             chat_print(f'\n[Transcription]\n"{text}"\n')
 
             raw_reply = ask_qwen_stream_collect(
-                text, model=args.qwen_model, system_prompt=SYSTEM_PROMPT, keep_alive=keep_alive
+                text, model=args.qwen_model, system_prompt=active_prompt, keep_alive=keep_alive
             )
 
             emotion, spoken = parse_emotion_and_spoken_text(raw_reply)

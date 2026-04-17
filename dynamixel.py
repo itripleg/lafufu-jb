@@ -38,6 +38,10 @@ PRE_ROLL_CHUNKS = int(0.35 * (RATE / CHUNK))
 
 # ------------------ TTS temp render ------------------
 TTS_WAV_FILENAME = "tts_temp.wav"
+TTS_SLOW_WAV_FILENAME = "tts_temp_slow.wav"
+# <1 = slower (slow_audio.process_one rate). ~0.85 = modest slowdown.
+TTS_SLOW_RATE = 0.85
+TTS_SLOW_ENGINE = "pedalboard"  # falls back to wsola if pedalboard fails
 
 # ------------------ Lafufu voice preset (offline) ------------------
 LAFUFU_VOICE_PRESET = "lafufu"
@@ -47,22 +51,14 @@ LAFUFU_ESPEAK_VOICE = "en-us"
 LAFUFU_PYTTSX3_KEYWORDS = ("child", "kid", "young", "girl", "boy", "zira", "hazel", "aria", "jenny")
 
 # ------------------ Piper TTS (offline) ------------------
-_IS_WINDOWS = platform.system().lower() == "windows"
-PIPER_MODEL_DEFAULT = (
-    "models/en_US-libritts-high.onnx"
-    if _IS_WINDOWS
-    else "models/en_US-libritts_r-medium.onnx"
-)
+PIPER_MODEL_DEFAULT = "models/lafufu_voice.onnx"
 PIPER_CONFIG_DEFAULT = PIPER_MODEL_DEFAULT + ".json"
+# First match wins; Lafufu voice first, then generic English fallbacks.
 PIPER_MODEL_CANDIDATES = (
+    "models/lafufu_voice.onnx",
     "models/en_US-libritts-high.onnx",
     "models/en_US-libritts_r-medium.onnx",
     "models/en_US-libritts-medium.onnx",
-    "models/en_US-libritts-low.onnx",
-) if _IS_WINDOWS else (
-    "models/en_US-libritts_r-medium.onnx",
-    "models/en_US-libritts-medium.onnx",
-    "models/en_US-libritts-high.onnx",
     "models/en_US-libritts-low.onnx",
 )
 PIPER_SPEAKER_DEFAULT = 0
@@ -1504,7 +1500,7 @@ def speak(tts_config: dict, text: str) -> None:
         out_wav = Path(TTS_WAV_FILENAME)
         ok = render_tts_to_wav(tts_config, text, out_wav)
         if ok:
-            play_wav_plain(out_wav)
+            play_wav_plain(_maybe_slow_tts_wav(out_wav))
         return
     if engine == "espeak":
         rate, volume, voice, pitch = _resolve_tts_params(engine, tts_config)
@@ -1564,6 +1560,51 @@ def render_tts_to_wav(tts_config: dict, text: str, out_wav: Path) -> bool:
         return out_wav.exists() and out_wav.stat().st_size > 44
     except Exception:
         return False
+
+
+def _maybe_slow_tts_wav(wav_path: Path) -> Path:
+    """Slow rendered TTS WAV via slow_audio before playback; return original on failure."""
+    if not wav_path.exists():
+        return wav_path
+
+    rate = float(os.environ.get("LAFUFU_TTS_SLOW_RATE", TTS_SLOW_RATE))
+    if abs(rate - 1.0) < 1e-3:
+        return wav_path
+
+    out_path = wav_path.with_name(TTS_SLOW_WAV_FILENAME)
+    try:
+        if out_path.exists():
+            out_path.unlink()
+    except Exception:
+        pass
+
+    engine = (os.environ.get("LAFUFU_TTS_SLOW_ENGINE", TTS_SLOW_ENGINE) or "pedalboard").strip().lower()
+    trim_tail_db = float(os.environ.get("LAFUFU_TTS_SLOW_TRIM_TAIL_DB", "0") or 0.0)
+
+    try:
+        import slow_audio
+
+        try:
+            slow_audio.process_one(
+                Path(wav_path),
+                Path(out_path),
+                rate=float(rate),
+                engine=engine,
+                trim_tail_db=float(trim_tail_db),
+            )
+        except Exception:
+            slow_audio.process_one(
+                Path(wav_path),
+                Path(out_path),
+                rate=float(rate),
+                engine="wsola",
+                trim_tail_db=float(trim_tail_db),
+            )
+    except Exception:
+        return wav_path
+
+    return out_path if out_path.exists() and out_path.stat().st_size > 44 else wav_path
+
 
 def _find_usb_speaker():
     """Auto-detect a USB speaker (prefer Jabra, fall back to first USB audio)."""
@@ -1773,7 +1814,7 @@ def speak_with_lipsync(tts_config: dict, text: str, head_expression: str = None)
     if not ok:
         speak(tts_config, text)
         return
-    play_wav_with_lipsync(out_wav, head_expression=head_expression)
+    play_wav_with_lipsync(_maybe_slow_tts_wav(out_wav), head_expression=head_expression)
 
 # ------------------ Main ------------------
 def main() -> int:

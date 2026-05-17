@@ -1,2 +1,5 @@
 models filter=lfs diff=lfs merge=lfs -text
 models/en_US-libritts-high.onnx filter=lfs diff=lfs merge=lfs -text
+
+# Shell scripts run on the Pi (Linux); force LF regardless of checkout OS.
+*.sh text eol=lf

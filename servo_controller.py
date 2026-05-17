@@ -11,6 +11,8 @@ Numpad layout:
   q = quit
 """
 
+import argparse
+import os
 import sys
 import time
 import tty
@@ -18,8 +20,8 @@ import termios
 
 from dynamixel_sdk import PortHandler, PacketHandler
 
-PORT = "/dev/ttyUSB0"
-BAUD = 57600
+DEFAULT_PORT = "/dev/ttyUSB0"
+DEFAULT_BAUD = 57600
 
 DXL_IDS = {"jaw": 4, "head_ud": 2, "head_lr": 1, "eye": 5, "brow": 3}
 
@@ -70,9 +72,27 @@ def getch():
 
 
 def main():
-    port = PortHandler(PORT)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--port",
+        default=os.environ.get("LAFUFU_DXL_PORT", DEFAULT_PORT),
+        help=f"Serial port for the U2D2 (default: $LAFUFU_DXL_PORT or {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=int(os.environ.get("LAFUFU_DXL_BAUD", DEFAULT_BAUD)),
+        help=f"Baud rate (default: $LAFUFU_DXL_BAUD or {DEFAULT_BAUD})",
+    )
+    args = parser.parse_args()
+
+    print(f"Opening {args.port} @ {args.baud}")
+    port = PortHandler(args.port)
     port.openPort()
-    port.setBaudRate(BAUD)
+    port.setBaudRate(args.baud)
     pk = PacketHandler(2.0)
 
     # Enable torque and read current positions

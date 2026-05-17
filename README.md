@@ -96,11 +96,12 @@ pkill -f dynamixel.py
 # Syntax check after editing
 python -c "import py_compile; py_compile.compile('dynamixel.py', doraise=True)"
 
-# Test audio output
-aplay -D plughw:CARD=USB,DEV=0 /tmp/test.wav
+# Test audio output (uses ALSA default; list devices with `aplay -L`,
+# or set LAFUFU_APLAY_DEVICE to override the device the app uses)
+aplay -D default /tmp/test.wav
 
 # Generate TTS manually
 source ~/lafufu-env/bin/activate
 echo "Hello world" | piper --model /lafufu/models/*.onnx --output_file /tmp/test.wav
-aplay -D plughw:CARD=USB,DEV=0 /tmp/test.wav
+aplay -D default /tmp/test.wav
 ```

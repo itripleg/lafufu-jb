@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime audio artifacts (recording buffer + TTS output)
+temp.wav
+tts_temp*.wav
+
+# Background asset (kept on the Pi, not in the repo)
+lafufu_background.mp4
+
+# Local dev helpers (SSH/SFTP wrappers, ad-hoc scripts)
+.sshrun.py
+.sftpput.py
+.sftpget.py
+.pull_from_pi.py
+
+# /simplify review scratch
+.review-*.patch

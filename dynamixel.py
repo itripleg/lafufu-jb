@@ -1,4 +1,5 @@
 import argparse
+import atexit
 import json
 import math
 import os
@@ -7,6 +8,7 @@ import shutil
 import signal
 import threading
 import platform
+import re
 import socket
 import subprocess
 import sys
@@ -23,10 +25,10 @@ import pyttsx3
 import whisper
 
 # ------------------ Audio / VAD ------------------
-CHUNK = 1764           # ~40 ms at 44100 Hz (was 600 at 16 kHz)
+CHUNK = 1764           # ~40 ms at 44100 Hz
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
-MIC_RATE = 44100       # native rate of the Shure MV88
+MIC_RATE = 44100       # preferred capture rate; auto-falls back to device's defaultSampleRate
 WHISPER_RATE = 16000   # Whisper expects 16 kHz
 RATE = MIC_RATE        # recording rate
 OUTPUT_FILENAME = "temp.wav"
@@ -361,8 +363,21 @@ class StatusLine:
 _status = StatusLine()
 
 # Suppress ALSA/JACK stderr spam during PyAudio init on Linux
-def _quiet_pyaudio():
-    """Create a PyAudio instance with stderr suppressed."""
+_pyaudio_singleton: "pyaudio.PyAudio | None" = None
+
+def _get_pyaudio():
+    """Return the process-wide PyAudio instance, creating it on first use.
+
+    PyAudio init is slow on the Pi (~100-300ms for ALSA enumeration) and
+    noisy on stderr. We keep one instance for the process lifetime and
+    let atexit clean it up. Callers must NOT call .terminate() on the
+    returned instance.
+    """
+    global _pyaudio_singleton
+    if _pyaudio_singleton is not None:
+        return _pyaudio_singleton
+
+    # Suppress ALSA's stderr chatter during init.
     devnull = None
     old_fd = None
     try:
@@ -372,14 +387,25 @@ def _quiet_pyaudio():
     except OSError:
         pass
     try:
-        p = pyaudio.PyAudio()
+        _pyaudio_singleton = pyaudio.PyAudio()
     finally:
         if old_fd is not None:
             os.dup2(old_fd, 2)
             os.close(old_fd)
         if devnull is not None:
             os.close(devnull)
-    return p
+    return _pyaudio_singleton
+
+
+@atexit.register
+def _terminate_pyaudio():
+    global _pyaudio_singleton
+    if _pyaudio_singleton is not None:
+        try:
+            _pyaudio_singleton.terminate()
+        except Exception:
+            pass
+        _pyaudio_singleton = None
 
 def chat_print(s: str = "", end: str = "\n") -> None:
     _status.suspend_for_chat()
@@ -892,6 +918,98 @@ def pa_format_from_sample_width(sample_width: int):
     return None
 
 # ------------------ Recording / Whisper ------------------
+# Audio device selection (shared by mic input and speaker output).
+# Production names go in PREFER. AVOID skips ALSA pseudo-devices like
+# "monitor of …" loopbacks and soundbar fake-capture endpoints.
+# Override per side via env:
+#   LAFUFU_{INPUT,OUTPUT}_DEVICE          — force exact int index or name substring
+#   LAFUFU_{INPUT,OUTPUT}_DEVICE_PREFER   — comma-separated substring list
+#   LAFUFU_{INPUT,OUTPUT}_DEVICE_AVOID    — comma-separated substring list
+_DEFAULT_INPUT_PREFER = ("shure", "jabra")
+_DEFAULT_INPUT_AVOID = ("soundbar", "monitor of", "output", "playback")
+_DEFAULT_OUTPUT_PREFER = ("jabra",)
+_DEFAULT_OUTPUT_AVOID = ("monitor of",)
+_selector_logged: dict[str, bool] = {}
+
+_DIRECTION_CONFIG = {
+    "input":  ("maxInputChannels",  "LAFUFU_INPUT_DEVICE",  _DEFAULT_INPUT_PREFER,  _DEFAULT_INPUT_AVOID,  "mic"),
+    "output": ("maxOutputChannels", "LAFUFU_OUTPUT_DEVICE", _DEFAULT_OUTPUT_PREFER, _DEFAULT_OUTPUT_AVOID, "speaker"),
+}
+
+def _select_audio_device(p, *, direction: str) -> int | None:
+    """Pick a pyaudio device index for ``direction`` ("input" or "output").
+
+    Resolution order:
+      1. LAFUFU_<DIR>_DEVICE — exact int index, OR substring of device name.
+      2. PREFER list — first matching device whose name contains a preferred substring.
+      3. First device whose name doesn't match the AVOID list.
+      4. None — pyaudio's host default.
+    """
+    channel_key, env_prefix, default_prefer, default_avoid, log_tag = _DIRECTION_CONFIG[direction]
+
+    devices = []
+    for i in range(p.get_device_count()):
+        info = p.get_device_info_by_index(i)
+        if info.get(channel_key, 0) > 0:
+            devices.append((i, info.get("name", "")))
+
+    def _env_list(name: str, fallback: tuple) -> tuple:
+        raw = os.environ.get(name)
+        if not raw:
+            return fallback
+        return tuple(s.strip().lower() for s in raw.split(",") if s.strip())
+
+    avoid = _env_list(f"{env_prefix}_AVOID", default_avoid)
+    prefer = _env_list(f"{env_prefix}_PREFER", default_prefer)
+    forced = (os.environ.get(env_prefix) or "").strip()
+
+    chosen: int | None = None
+    reason = "system default"
+
+    if forced:
+        if forced.isdigit():
+            idx = int(forced)
+            if any(i == idx for i, _ in devices):
+                chosen = idx
+                reason = f"{env_prefix}={forced}"
+        else:
+            needle = forced.lower()
+            for i, name in devices:
+                if needle in name.lower():
+                    chosen = i
+                    reason = f"{env_prefix}~={forced!r} → {name!r}"
+                    break
+
+    if chosen is None:
+        for needle in prefer:
+            for i, name in devices:
+                if needle in name.lower():
+                    chosen = i
+                    reason = f"prefer={needle!r} → {name!r}"
+                    break
+            if chosen is not None:
+                break
+
+    if chosen is None:
+        for i, name in devices:
+            if not any(s in name.lower() for s in avoid):
+                chosen = i
+                reason = f"first non-avoided → {name!r}"
+                break
+
+    if not _selector_logged.get(direction):
+        chat_print(f"[{log_tag}] {reason}")
+        _selector_logged[direction] = True
+    return chosen
+
+
+def _select_input_device(p) -> int | None:
+    return _select_audio_device(p, direction="input")
+
+
+def _select_output_device(p) -> int | None:
+    return _select_audio_device(p, direction="output")
+
 def record_until_silence() -> Path:
     _idle_suspend()
     chat_print("\n🎙️ Listening… (auto-stop on silence)")
@@ -899,34 +1017,49 @@ def record_until_silence() -> Path:
     _eye_set_target(EYE_IDLE_DXL)
     _brow_set_target(BROW_IDLE_DXL)
 
-    p = _quiet_pyaudio()
-    # Find the Shure mic (44100 Hz) — avoid Jabra mic (16000 Hz)
-    input_device = None
-    for i in range(p.get_device_count()):
-        info = p.get_device_info_by_index(i)
-        if info["maxInputChannels"] > 0 and "shure" in info["name"].lower():
-            input_device = i
-            break
+    p = _get_pyaudio()
+    input_device = _select_input_device(p)
+
+    # Pick a sample rate the chosen device actually supports. If the configured
+    # RATE is rejected, fall back to the device's defaultSampleRate. Whisper
+    # resamples downstream.
+    eff_rate = RATE
+    try:
+        if input_device is not None and not p.is_format_supported(
+            float(RATE),
+            input_device=input_device,
+            input_channels=CHANNELS,
+            input_format=FORMAT,
+        ):
+            eff_rate = int(p.get_device_info_by_index(input_device).get("defaultSampleRate", 16000))
+    except (ValueError, OSError):
+        if input_device is not None:
+            eff_rate = int(p.get_device_info_by_index(input_device).get("defaultSampleRate", 16000))
+    if eff_rate != RATE:
+        chat_print(f"[mic] device rejected {RATE} Hz; using {eff_rate} Hz")
+
+    eff_chunk = max(1, int(eff_rate * 0.04))  # ~40 ms
+
     stream = p.open(
         format=FORMAT,
         channels=CHANNELS,
-        rate=RATE,
+        rate=eff_rate,
         input=True,
         input_device_index=input_device,
-        frames_per_buffer=CHUNK,
+        frames_per_buffer=eff_chunk,
     )
 
     frames, silent_chunks = [], 0
     pre_roll = deque(maxlen=max(PRE_ROLL_CHUNKS, 1))
     started = False
     total_chunks = 0
-    max_chunks = int(RATE / CHUNK * MAX_RECORD_SECONDS)
-    dt = CHUNK / RATE
+    max_chunks = int(eff_rate / eff_chunk * MAX_RECORD_SECONDS)
+    dt = eff_chunk / eff_rate
 
     try:
         try:
             while True:
-                data = stream.read(CHUNK, exception_on_overflow=False)
+                data = stream.read(eff_chunk, exception_on_overflow=False)
                 rms = audio_rms(data)
                 total_chunks += 1
 
@@ -955,12 +1088,11 @@ def record_until_silence() -> Path:
         finally:
             stream.stop_stream()
             stream.close()
-            p.terminate()
 
         raw = b"".join(frames)
-        if MIC_RATE != WHISPER_RATE:
+        if eff_rate != WHISPER_RATE:
             raw, _ = audioop.ratecv(raw, p.get_sample_size(FORMAT), CHANNELS,
-                                    MIC_RATE, WHISPER_RATE, None)
+                                    eff_rate, WHISPER_RATE, None)
         with wave.open(OUTPUT_FILENAME, "wb") as wf:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(p.get_sample_size(FORMAT))
@@ -1012,11 +1144,15 @@ def warmup_qwen(model: str, system_prompt: str, keep_alive=None) -> None:
     }
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
+
+    chat_print(f"⏳ Warming up {model} (cold load can take 30–60s on Pi)...")
+    t0 = time.monotonic()
     try:
         with _ollama_chat(payload, timeout=300) as resp:
             resp.read()
-    except Exception:
-        pass
+        chat_print(f"✅ {model} ready in {time.monotonic() - t0:.1f}s")
+    except Exception as e:
+        chat_print(f"⚠️  {model} warmup failed after {time.monotonic() - t0:.1f}s: {e}")
 
 def ask_qwen_stream_collect(prompt: str, model: str, system_prompt: str = None, keep_alive=None) -> str:
     messages = []
@@ -1606,36 +1742,51 @@ def _maybe_slow_tts_wav(wav_path: Path) -> Path:
     return out_path if out_path.exists() and out_path.stat().st_size > 44 else wav_path
 
 
-def _find_usb_speaker():
-    """Auto-detect a USB speaker (prefer Jabra, fall back to first USB audio)."""
+def _alsa_hw_from_pyaudio_name(name: str) -> str | None:
+    """Extract an ALSA plughw string from a pyaudio device name.
+
+    PyAudio names on Linux/ALSA typically end with "(hw:N,M)". Returns
+    "plughw:N,M" if matched, else None — letting callers fall back to
+    ALSA's "default".
+    """
+    m = re.search(r"\(hw:(\d+),(\d+)\)", name)
+    return f"plughw:{m.group(1)},{m.group(2)}" if m else None
+
+
+def _resolve_aplay_device() -> str:
+    """Resolve the ALSA device string for aplay.
+
+    Priority: LAFUFU_APLAY_DEVICE env (explicit, not cached so runtime
+    changes are honored) → device detected via _select_output_device
+    (cached on first successful resolve) → ALSA "default".
+    """
+    explicit = os.environ.get("LAFUFU_APLAY_DEVICE")
+    if explicit:
+        return explicit
+
+    cached = getattr(_resolve_aplay_device, "_cache", None)
+    if cached is not None:
+        return cached
+
+    resolved: str | None = None
     try:
-        p = _quiet_pyaudio()
-        for i in range(p.get_device_count()):
-            info = p.get_device_info_by_index(i)
-            if info["maxOutputChannels"] > 0:
-                name = info["name"].lower()
-                if "jabra" in name or ("usb" in name and "shure" not in name):
-                    p.terminate()
-                    # Return ALSA hw name from card index
-                    card = info.get("name", "")
-                    return f"plughw:{info['index']}"
-        p.terminate()
+        p = _get_pyaudio()
+        idx = _select_output_device(p)
+        if idx is not None:
+            info = p.get_device_info_by_index(idx)
+            resolved = _alsa_hw_from_pyaudio_name(info.get("name", ""))
     except Exception:
-        pass
-    return None
+        resolved = None
+
+    _resolve_aplay_device._cache = resolved or "default"
+    return _resolve_aplay_device._cache
+
 
 def _aplay_cmd(wav_path: Path):
     aplay_path = shutil.which("aplay")
     if not aplay_path:
         return None
-    cmd = [aplay_path, "-q"]
-    device = os.environ.get("LAFUFU_APLAY_DEVICE")
-    if not device:
-        device = "plughw:CARD=USB,DEV=0"   # Jabra SPEAK 510
-    if device:
-        cmd.extend(["-D", device])
-    cmd.append(str(wav_path))
-    return cmd
+    return [aplay_path, "-q", "-D", _resolve_aplay_device(), str(wav_path)]
 
 def play_wav_plain(wav_path: Path) -> None:
     if not wav_path.exists():
@@ -1660,7 +1811,7 @@ def play_wav_plain(wav_path: Path) -> None:
             subprocess.run(["aplay", str(wav_path)], check=False)
         return
 
-    p = _quiet_pyaudio()
+    p = _get_pyaudio()
     stream = p.open(
         format=pa_fmt,
         channels=channels,
@@ -1676,7 +1827,6 @@ def play_wav_plain(wav_path: Path) -> None:
     finally:
         stream.stop_stream()
         stream.close()
-        p.terminate()
         wf.close()
 
 def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
@@ -1742,7 +1892,7 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
                 if platform.system().lower() == "linux":
                     subprocess.run(["aplay", str(wav_path)], check=False)
                 return
-            pa_inst = _quiet_pyaudio()
+            pa_inst = _get_pyaudio()
             pa_stream = pa_inst.open(
                 format=pa_fmt,
                 channels=channels,
@@ -1799,8 +1949,6 @@ def play_wav_with_lipsync(wav_path: Path, head_expression: str = None) -> None:
             if pa_stream:
                 pa_stream.stop_stream()
                 pa_stream.close()
-            if pa_inst:
-                pa_inst.terminate()
             if aplay_proc:
                 aplay_proc.wait()
 
@@ -1867,6 +2015,7 @@ def main() -> int:
     parser.add_argument("--dxl-baud", type=int, default=0, help="If 0, tries common baud rates.")
     parser.add_argument("--dxl-hz", type=float, default=50.0, help="Max send rate to motors.")
     parser.add_argument("--leave-torque", action="store_true", help="Do not torque-disable on exit.")
+    parser.add_argument("--require-dxl", action="store_true", help="Exit with code 2 if the U2D2 servo bus is missing or fails to open. Default: warn and continue without servos.")
     args = parser.parse_args()
     _idle_show_status = not args.text_input
 
@@ -1886,23 +2035,28 @@ def main() -> int:
     seed_jaw_dxl = MOUTH_CLOSE_DXL
     enable_printer = not args.no_printer
 
-    # REAL Dynamixel default (unless --sim)
-    if not args.sim:
+    # REAL Dynamixel default (unless --sim). If hardware is missing, warn and
+    # continue without servos so audio + UDP outputs still run. Use --require-dxl
+    # to restore the old fail-hard behavior.
+    if args.sim:
+        _dxl_bus = None
+        chat_print("SIM mode: no Dynamixel output (UDP only).")
+    else:
         baud_candidates = [args.dxl_baud] if args.dxl_baud else [57600, 115200, 1000000, 2000000, 3000000, 4000000]
         port = args.dxl_port.strip()
         required_names = list(DXL_IDS.keys())
+        baud = None
 
-        if not port:
-            found_port, found_baud = _auto_find_u2d2_port_and_baud(baud_candidates)
-            if not found_port:
-                chat_print("❌ Could not auto-find U2D2 bus. Provide --dxl-port COMx and --dxl-baud N.")
-                return 2
-            port, baud = found_port, found_baud
-        else:
-            baud = int(args.dxl_baud) if args.dxl_baud else 1000000
-
-        chat_print(f"DXL: opening {port} @ {baud} ... (close Dynamixel Wizard first)")
         try:
+            if not port:
+                found_port, found_baud = _auto_find_u2d2_port_and_baud(baud_candidates)
+                if not found_port:
+                    raise RuntimeError("could not auto-find U2D2 bus (is the USB cable connected?)")
+                port, baud = found_port, found_baud
+            else:
+                baud = int(args.dxl_baud) if args.dxl_baud else 1000000
+
+            chat_print(f"DXL: opening {port} @ {baud} ... (close Dynamixel Wizard first)")
             _dxl_bus = DynamixelBus(port=port, baud=baud, hz=args.dxl_hz, leave_torque=args.leave_torque)
             present_start = _dxl_bus.open(required_names=required_names)
 
@@ -1916,11 +2070,16 @@ def main() -> int:
 
             chat_print("✅ DXL connected.")
         except Exception as e:
-            chat_print(f"❌ DXL init failed: {e}")
-            return 2
-    else:
-        _dxl_bus = None
-        chat_print("SIM mode: no Dynamixel output (UDP only).")
+            if args.require_dxl:
+                chat_print(f"❌ DXL init failed: {e}")
+                return 2
+            chat_print(f"⚠️  DXL unavailable ({e}); continuing without servos.")
+            if _dxl_bus is not None:
+                try:
+                    _dxl_bus.close()
+                except Exception:
+                    pass
+            _dxl_bus = None
 
     # Register signal handlers so torque is disabled on SIGTERM / Ctrl+C
     def _shutdown_handler(signum, _frame):
